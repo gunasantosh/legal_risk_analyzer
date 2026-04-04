@@ -1,0 +1,12 @@
+openenv-core[core]>=0.2.2
+openai>=1.0.0
+pydantic
+httpx>=0.24.0
+python-dotenv>=1.2.2
+gradio>=4.0.0
+huggingface-hub>=1.9.0
+typer>=0.24.1
+
+[dev]
+pytest>=8.0.0
+pytest-cov>=4.0.0
