@@ -3,6 +3,7 @@ __init__.py
 client.py
 gradio_app.py
 inference.py
+models.py
 pyproject.toml
 ./__init__.py
 ./client.py

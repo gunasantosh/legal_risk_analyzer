@@ -1,5 +1,4 @@
 from typing import Literal
-
 from openenv.core.env_server.types import Action, Observation
 from pydantic import Field
 

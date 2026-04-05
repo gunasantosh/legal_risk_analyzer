@@ -1,9 +1,7 @@
 from typing import Dict
-
 from openenv.core import EnvClient
 from openenv.core.client_types import StepResult
 from openenv.core.env_server.types import State
-
 try:
     from models import LegalAction, LegalObservation
 except ImportError:
@@ -16,7 +14,7 @@ class LegalRiskEnvClient(EnvClient[LegalAction, LegalObservation, State]):
             "action_type": action.action_type,
             "text_content": action.text_content,
         }
-
+    
     def _parse_result(self, payload: Dict) -> StepResult[LegalObservation]:
         obs_data = payload.get("observation", {})
         observation = LegalObservation(
@@ -27,13 +25,12 @@ class LegalRiskEnvClient(EnvClient[LegalAction, LegalObservation, State]):
             reward=payload.get("reward", 0.0),
             metadata=obs_data.get("metadata", {}),
         )
-
         return StepResult(
             observation=observation,
             reward=payload.get("reward", 0.0),
             done=payload.get("done", False),
         )
-
+    
     def _parse_state(self, payload: Dict) -> State:
         return State(
             episode_id=payload.get("episode_id"),
