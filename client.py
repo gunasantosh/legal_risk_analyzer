@@ -17,18 +17,27 @@ class LegalRiskEnvClient(EnvClient[LegalAction, LegalObservation, State]):
     
     def _parse_result(self, payload: Dict) -> StepResult[LegalObservation]:
         obs_data = payload.get("observation", {})
+        obs_reward = obs_data.get("reward")
+        top_level_reward = payload.get("reward")
+        reward = obs_reward if obs_reward is not None else (top_level_reward or 0.0)
+
+        obs_done = obs_data.get("done")
+        top_level_done = payload.get("done")
+        done = obs_done if obs_done is not None else bool(top_level_done)
+
         observation = LegalObservation(
             contract_text=obs_data.get("contract_text", ""),
             task_id=obs_data.get("task_id", 1),
             current_risk_assessment=obs_data.get("current_risk_assessment", ""),
-            done=payload.get("done", False),
-            reward=payload.get("reward", 0.0),
+            done=done,
+            reward=reward,
+            message=obs_data.get("message", ""),
             metadata=obs_data.get("metadata", {}),
         )
         return StepResult(
             observation=observation,
-            reward=payload.get("reward", 0.0),
-            done=payload.get("done", False),
+            reward=reward,
+            done=done,
         )
     
     def _parse_state(self, payload: Dict) -> State:

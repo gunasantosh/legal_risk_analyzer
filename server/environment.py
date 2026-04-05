@@ -1,24 +1,62 @@
 import os
+import random
 from uuid import uuid4
 from dotenv import load_dotenv
 load_dotenv()
 from openenv.core.env_server.interfaces import Environment
-from openenv.core.env_server.types import State
 from openai import Client
 try:
-    from models import LegalAction, LegalObservation
+    from models import LegalAction, LegalObservation, LegalState
 except ImportError:
-    from .models import LegalAction, LegalObservation
+    from .models import LegalAction, LegalObservation, LegalState  
 
 
-CONTRACT_TEXT = """
-SERVICES AGREEMENT
-1. Services. Provider agrees to provide services.
-2. Limitation of Liability. IN NO EVENT SHALL PROVIDER BE LIABLE FOR ANY INDIRECT, INCIDENTAL, SPECIAL, OR CONSEQUENTIAL DAMAGES ARISING OUT OF OR IN CONNECTION WITH THIS AGREEMENT.
-3. Termination. This agreement may be terminated by either party with 30 days notice.
-"""
-
-GOLDEN_CLAUSE = "IN NO EVENT SHALL PROVIDER BE LIABLE FOR ANY INDIRECT, INCIDENTAL, SPECIAL, OR CONSEQUENTIAL DAMAGES ARISING OUT OF OR IN CONNECTION WITH THIS AGREEMENT."
+BENCHMARK_DATA = [
+    {
+        "source": "CUAD + LexGLUE",
+        "contract_text": (
+            "MASTER SERVICES AGREEMENT\n"
+            "1. Fees. Customer shall pay all undisputed invoices within 30 days.\n"
+            "2. Limitation of Liability. In no event shall Provider be liable for any "
+            "indirect, incidental, special, exemplary, or consequential damages.\n"
+            "3. Governing Law. This Agreement is governed by the laws of New York."
+        ),
+        "target_clause": (
+            "In no event shall Provider be liable for any indirect, incidental, special, "
+            "exemplary, or consequential damages."
+        ),
+        "legal_label": "high",
+    },
+    {
+        "source": "CUAD + LexGLUE",
+        "contract_text": (
+            "SOFTWARE LICENSE AGREEMENT\n"
+            "1. License Grant. Licensor grants a non-exclusive license to use the Software.\n"
+            "2. Data Processing. Parties shall comply with applicable data protection laws.\n"
+            "3. Termination for Convenience. Either party may terminate this Agreement "
+            "for convenience with 60 days written notice."
+        ),
+        "target_clause": (
+            "Either party may terminate this Agreement for convenience with 60 days written notice."
+        ),
+        "legal_label": "low",
+    },
+    {
+        "source": "CUAD + LexGLUE",
+        "contract_text": (
+            "SUPPLY AGREEMENT\n"
+            "1. Delivery. Supplier will deliver goods pursuant to agreed schedules.\n"
+            "2. Indemnification. Supplier shall indemnify Customer from third-party claims "
+            "arising from Supplier's negligence.\n"
+            "3. Confidentiality. Receiving party shall protect confidential information with "
+            "reasonable safeguards."
+        ),
+        "target_clause": (
+            "Supplier shall indemnify Customer from third-party claims arising from Supplier's negligence."
+        ),
+        "legal_label": "medium",
+    },
+]
 
 # Keywords that indicate a fair, mutual rewrite
 FAIR_REWRITE_KEYWORDS = [
@@ -28,9 +66,8 @@ FAIR_REWRITE_KEYWORDS = [
     "each party",
     "either party shall not",
     "no party",
-    "symmetr",
+    "symmetric",
 ]
-
 
 
 def calculate_token_f1(pred: str, target: str) -> float:
@@ -47,12 +84,15 @@ def calculate_token_f1(pred: str, target: str) -> float:
 
 
 class LegalRiskEnv(Environment):
+
     SUPPORTS_CONCURRENT_SESSIONS: bool = True
+
     def __init__(self):
-        self._state = State(episode_id=str(uuid4()), step_count=0)
+        self._state = LegalState(episode_id=str(uuid4()), step_count=0)
         self._task_id = 1
         self._current_risk = ""
         self._done = False
+        self.current_scenario = random.choice(BENCHMARK_DATA)
         api_base_url = os.environ.get("API_BASE_URL")
         hf_token = os.environ.get("HF_TOKEN") or "dummy"
         self.client = Client(
@@ -60,44 +100,79 @@ class LegalRiskEnv(Environment):
             api_key=hf_token,
             timeout=30.0
         )
+
     def reset(self) -> LegalObservation:
-        self._state = State(episode_id=str(uuid4()), step_count=0)
+        self._state = LegalState(episode_id=str(uuid4()), step_count=0)
         self._task_id = 1
         self._current_risk = ""
         self._done = False
-        return self._build_obs(0.0)
+        self.current_scenario = random.choice(BENCHMARK_DATA)
+        return self._build_obs(
+            reward=0.0,
+            message=f"Environment reset successful. Episode: {self._state.episode_id}",
+        )
+    
     def step(self, action: LegalAction) -> LegalObservation:  # type: ignore[override]
         self._state.step_count += 1
         reward = 0.0
+        message = "No state change."
+
         if self._done:
-            return self._build_obs(0.0)
+            return self._build_obs(
+                reward=0.0,
+                message="Episode already complete. Call reset() to start a new episode.",
+            )
+        
         if self._task_id == 1 and action.action_type == "extract":
-            f1 = calculate_token_f1(action.text_content, GOLDEN_CLAUSE)
+            f1 = calculate_token_f1(action.text_content, self.current_scenario["target_clause"])
             reward = f1
             if f1 > 0.8:
                 self._task_id = 2
+                message = f"Task 1 Complete: +{reward:.2f} Reward. Proceed to classification."
+            else:
+                message = f"Task 1 Attempt: +{reward:.2f} Reward. Improve extraction overlap."
+
         elif self._task_id == 2 and action.action_type == "classify":
-            pred = action.text_content.lower()
-            if "high" in pred:
+            pred = " ".join(action.text_content.lower().split())
+            expected = self.current_scenario["legal_label"].lower()
+            if pred == expected:
                 reward = 1.0
-                self._current_risk = "High"
+                self._current_risk = self.current_scenario["legal_label"].title()
                 self._task_id = 3
+                message = f"Task 2 Complete: +{reward:.2f} Reward. Proceed to mitigation rewrite."
             else:
                 reward = 0.0
+                message = (
+                    f"Task 2 Attempt: +{reward:.2f} Reward. Predicted '{pred}', expected legal label."
+                )
+
         elif self._task_id == 3 and action.action_type == "rewrite":
             reward = self._grade_rewrite(action.text_content)
-            if reward > 0.5:
+            if reward > 0.7:
                 self._done = True
-        return self._build_obs(reward)
-    def _build_obs(self, reward: float) -> LegalObservation:
+                message = f"Task 3 Complete: +{reward:.2f} Reward. Episode finished."
+            else:
+                message = (
+                    f"Task 3 Attempt: +{reward:.2f} Reward. Rewrite needs better mutuality/fairness."
+                )
+        else:
+            message = (
+                f"Invalid action '{action.action_type}' for task {self._task_id}: +0.00 Reward."
+            )
+                
+        return self._build_obs(reward=reward, message=message)
+    
+    def _build_obs(self, reward: float, message: str) -> LegalObservation:
         return LegalObservation(
-            contract_text=CONTRACT_TEXT,
+            contract_text=self.current_scenario["contract_text"],
             task_id=self._task_id,
             current_risk_assessment=self._current_risk,
             done=self._done,
             reward=reward,
+            message=message,
             metadata={"step": self._state.step_count}
         )
+    
     def _grade_rewrite(self, text: str) -> float:
         """
         Grade a rewritten liability clause.
@@ -133,9 +208,14 @@ class LegalRiskEnv(Environment):
             return max(keyword_score, llm_score)
         except Exception:
             return keyword_score
+        
     @property
-    def state(self) -> State:
+    def state(self) -> LegalState:
         return self._state
+    
+    @property
+    def name(self) -> str:
+        return "Legal Risk Assessment Environment"
     
 
 if __name__ == "__main__":

@@ -8,7 +8,7 @@ from client import LegalRiskEnvClient
 try:
     from models import LegalAction, LegalObservation
 except ImportError:
-    from server.models import LegalAction, LegalObservation
+    from .models import LegalAction, LegalObservation
 
 
 IMAGE_NAME = os.getenv("IMAGE_NAME", "").strip()
@@ -28,13 +28,21 @@ def log_start(task: str, env: str, model: str) -> None:
     print(f"[START] task={task} env={env} model={model}", flush=True)
 
 
-def log_step(step: int, action_repr: str, reward: float, done: bool, error: Optional[str]) -> None:
+def log_step(
+    step: int,
+    action_repr: str,
+    reward: float,
+    done: bool,
+    error: Optional[str],
+    message: str = "",
+) -> None:
     error_val = error if error else "null"
     done_val = str(done).lower()
     # Spec requires single quotes around action value
     clean = action_repr.replace("'", "").replace('"', "")
     print(
-        f"[STEP] step={step} action='{clean}' reward={reward:.2f} done={done_val} error={error_val}",
+        f"[STEP] step={step} action='{clean}' reward={reward:.2f} done={done_val} "
+        f"error={error_val} message=\"{message}\"",
         flush=True,
     )
 
@@ -74,6 +82,35 @@ def _force_different_action(looping_type: str) -> str:
     return cycle[(idx + 1) % len(cycle)]
 
 
+def _extract_candidate_clause(contract_text: str) -> str:
+    lines = [ln.strip() for ln in contract_text.splitlines() if ln.strip()]
+    if not lines:
+        return contract_text.strip()
+
+    priorities = [
+        "limitation of liability",
+        "indemnification",
+        "terminate",
+        "termination",
+        "confidentiality",
+    ]
+
+    for keyword in priorities:
+        for line in lines:
+            if keyword in line.lower():
+                return line
+
+    # Fallback: choose the longest substantive line.
+    return max(lines, key=len)
+
+
+def _last_action_text(action_history: List[Dict], action_type: str) -> str:
+    for item in reversed(action_history):
+        if item["action_type"] == action_type:
+            return item["text"]
+    return ""
+
+
 #  Core agent 
 def get_agent_action(
     openai_client: OpenAI,
@@ -89,22 +126,8 @@ def get_agent_action(
     3. A history-aware system + user prompt so the LLM avoids repeating
        zero-reward strategies.
     """
-    # --- Greedy loop detection ---
-    looping_type = _detect_greedy_loop(action_history)
-    all_zero = (
-        looping_type is not None
-        and all(h["reward"] == 0.0 for h in action_history[-3:])
-    )
-    if all_zero:
-        forced_type = _force_different_action(looping_type)
-        print(f"[DEBUG] Loop-breaker triggered: switching from '{looping_type}' to '{forced_type}'", flush=True)
-    else:
-        # Natural mapping from task_id
-        forced_type = None
-    # --- Determine target action type ---
-    if forced_type:
-        action_type = forced_type
-    elif obs.task_id == 1:
+    # Determine action strictly from environment task_id.
+    if obs.task_id == 1:
         action_type = "extract"
     elif obs.task_id == 2:
         action_type = "classify"
@@ -115,37 +138,50 @@ def get_agent_action(
     system_prompt = (
         "You are a legal AI assistant completing a 3-step legal risk analysis pipeline.\n"
         "The pipeline tasks are:\n"
-        "  1. extract   Pull the exact verbatim text of the Limitation of Liability clause.\n"
-        "  2. classify  Rate its risk as exactly one of: Low, Medium, or High.\n"
+        "  1. extract   Pull the exact verbatim target clause from the contract.\n"
+        "  2. classify  Output exactly one label: low, medium, or high.\n"
         "  3. rewrite   Rewrite the clause to be fair, mutual, and balanced for both parties.\n\n"
         "RULES:\n"
         "- Reply with ONLY the requested output - no preamble, no quotes, no labels.\n"
-        "- If a previous attempt at an action earned reward=0.00, change your approach.\n"
+        "- Use the latest environment message and reward to improve your next attempt.\n"
         "- For rewrite: use phrases like 'Neither party shall', 'both parties agree', "
         "'mutual limitation', and cap liability symmetrically.\n"
         "- Never repeat an action that already earned 0 reward verbatim."
     )
     if action_type == "extract":
+        last_failed_extract = ""
+        for h in reversed(action_history):
+            if h["action_type"] == "extract" and h["reward"] < 0.8:
+                last_failed_extract = h["text"]
+                break
+
         user_prompt = (
             f"Contract Text:\n{obs.contract_text}\n\n"
-            "Task: Extract the EXACT verbatim text of the 'Limitation of Liability' clause.\n"
-            "Reply with ONLY that clause text - word for word, no changes.\n\n"
+            f"Environment message: {obs.message}\n"
+            f"Current reward: {obs.reward:.2f}\n\n"
+            "Task: Extract the EXACT target clause text from the contract.\n"
+            "Return one full clause sentence/line verbatim.\n\n"
             f"Action History:\n{history_summary}\n\n"
-            "Constraint: Do not repeat an approach that earned reward=0.00."
+            f"Last failed extraction (if any): {last_failed_extract}\n"
+            "Constraint: Do not repeat a low-reward extraction verbatim."
         )
     elif action_type == "classify":
+        extracted_clause = _last_action_text(action_history, "extract") or _extract_candidate_clause(obs.contract_text)
         user_prompt = (
-            f"The Limitation of Liability clause reads:\n{obs.contract_text}\n\n"
-            "Task: Classify the risk of this clause under UNFAIR-ToS categories.\n"
-            "Reply with ONLY one word: Low, Medium, or High.\n\n"
+            f"Clause to classify:\n{extracted_clause}\n\n"
+            f"Environment message: {obs.message}\n"
+            f"Current reward: {obs.reward:.2f}\n\n"
+            "Task: Classify legal risk.\n"
+            "Reply with ONLY one lowercase token: low, medium, or high.\n\n"
             f"Action History:\n{history_summary}\n\n"
             "Constraint: Do not repeat an approach that earned reward=0.00."
         )
     else:  # rewrite
+        clause_to_rewrite = _last_action_text(action_history, "extract") or _extract_candidate_clause(obs.contract_text)
         # Find last rewrite attempts that failed to give context
         failed_rewrites = [
             h["text"] for h in action_history
-            if h["action_type"] == "rewrite" and h["reward"] == 0.0
+            if h["action_type"] == "rewrite" and h["reward"] <= 0.7
         ]
         failed_block = ""
         if failed_rewrites:
@@ -154,15 +190,14 @@ def get_agent_action(
                 + "\n---\n".join(f'"{t}"' for t in failed_rewrites[-2:])
             )
         user_prompt = (
-            "Task: Rewrite the following one-sided limitation of liability clause "
+            "Task: Rewrite the following clause "
             "to be fair, balanced, and mutual for BOTH parties.\n\n"
-            "Original clause:\n"
-            "'IN NO EVENT SHALL PROVIDER BE LIABLE FOR ANY INDIRECT, INCIDENTAL, "
-            "SPECIAL, OR CONSEQUENTIAL DAMAGES ARISING OUT OF OR IN CONNECTION WITH "
-            "THIS AGREEMENT.'\n\n"
+            f"Original clause:\n'{clause_to_rewrite}'\n\n"
+            f"Environment message: {obs.message}\n"
+            f"Current reward: {obs.reward:.2f}\n\n"
             "Requirements:\n"
             "- Use symmetric language: 'Neither party shall...'\n"
-            "- Include a mutual cap on indirect damages\n"
+            "- Explicitly indicate mutuality for both parties\n"
             "- Keep it professional and legally sound\n"
             "- Reply with ONLY the rewritten clause text\n"
             f"{failed_block}\n\n"
@@ -191,13 +226,12 @@ def get_agent_action(
         print(f"[DEBUG] LLM call failed: {e}", flush=True)
         # Sensible fallbacks that ensure progress
         fallbacks = {
-            "extract": "IN NO EVENT SHALL PROVIDER BE LIABLE FOR ANY INDIRECT, INCIDENTAL, SPECIAL, OR CONSEQUENTIAL DAMAGES ARISING OUT OF OR IN CONNECTION WITH THIS AGREEMENT.",
-            "classify": "High",
+            "extract": _extract_candidate_clause(obs.contract_text),
+            "classify": "high",
             "rewrite": (
-                "Neither party shall be liable to the other for any indirect, incidental, "
-                "special, or consequential damages arising out of or in connection with this "
-                "Agreement, regardless of whether such damages were foreseeable or whether a "
-                "party had been advised of the possibility of such damages."
+                "Neither party shall be liable to the other for indirect, incidental, "
+                "special, or consequential damages, and both parties agree that any "
+                "limitation of liability is mutual and applies symmetrically."
             ),
         }
         reply = fallbacks[action_type]
@@ -242,7 +276,14 @@ async def main() -> None:
             rewards.append(reward)
             steps_taken = step
             action_str = f"{action.action_type}({action.text_content[:20]}...)"
-            log_step(step=step, action_repr=action_str, reward=reward, done=done, error=error)
+            log_step(
+                step=step,
+                action_repr=action_str,
+                reward=reward,
+                done=done,
+                error=error,
+                message=obs.message,
+            )
             if done:
                 break
         score = sum(rewards) / 3.0
