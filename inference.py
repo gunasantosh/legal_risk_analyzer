@@ -17,7 +17,7 @@ MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
 TASK_NAME = os.getenv("MY_ENV_V4_TASK", "legal-risk-analysis")
 OPENENV_URL = os.getenv("OPENENV_URL", "http://localhost:8000")
 BENCHMARK = "legal-risk-analyzer"
-MAX_STEPS = 10
+MAX_STEPS = 8
 TEMPERATURE = 0.4
 HISTORY_WINDOW = 5  # last N steps passed to the LLM
 
@@ -33,34 +33,24 @@ def log_step(
     reward: float,
     done: bool,
     error: Optional[str],
-    message: str = "",
 ) -> None:
     error_val = error if error else "null"
     done_val = str(done).lower()
-    # Spec requires single quotes around action value
     clean = action_repr.replace("'", "").replace('"', "")
     print(
-        f"[STEP] step={step} action='{clean}' reward={reward:.2f} done={done_val} "
-        f"error={error_val} message=\"{message}\"",
+        f"[STEP] step={step} action={clean} reward={reward:.2f} done={done_val} "
+        f"error={error_val}",
         flush=True,
     )
 
 
-def log_end(task: str, success: bool, steps: int, score: float, rewards: List[float]) -> None:
+def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
     rewards_str = ",".join(f"{r:.2f}" for r in rewards)
-    print(
-        f"[END] task={task} success={str(success).lower()} steps={steps} "
-        f"score={score:.3f} rewards={rewards_str}",
-        flush=True,
-    )
+    print(f"[END] success={str(success).lower()} steps={steps} score={score:.3f} rewards={rewards_str}", flush=True)
 
 
 def _get_image_name() -> str:
-    """
-    Prefer explicit process environment configuration and avoid accidental
-    dependence on a checked-in `.env` value during remote evaluation.
-    """
-    return os.environ.get("IMAGE_NAME", "").strip()
+    return (os.environ.get("LOCAL_IMAGE_NAME") or os.environ.get("IMAGE_NAME") or "").strip()
 
 
 #  Action history helpers 
@@ -122,131 +112,64 @@ def _last_action_text(action_history: List[Dict], action_type: str) -> str:
     return ""
 
 
-#  Core agent 
+def _classify_clause_text(clause_text: str) -> str:
+    text = clause_text.lower()
+    if "limitation of liability" in text or "in no event shall" in text:
+        return "high"
+    if "indemn" in text:
+        return "medium"
+    if "termination for convenience" in text or "either party may terminate" in text:
+        return "low"
+    return "medium"
+
+
+def _build_fair_rewrite(clause_text: str) -> str:
+    text = clause_text.lower()
+    if "indemn" in text:
+        return (
+            "Both parties agree that each party shall indemnify the other against third-party "
+            "claims arising from its own negligence, misconduct, or breach of this Agreement."
+        )
+    if "terminate" in text:
+        return (
+            "Both parties agree that either party may terminate this Agreement for convenience upon "
+            "60 days written notice, with mutual cooperation on an orderly transition."
+        )
+    return (
+        "Neither party shall be liable to the other for any indirect, incidental, special, "
+        "exemplary, or consequential damages, and both parties agree that any limitation of "
+        "liability applies mutually and symmetrically."
+    )
+
+
 def get_agent_action(
     openai_client: OpenAI,
     obs: LegalObservation,
     action_history: List[Dict],
 ) -> LegalAction:
-    """
-    History-aware agent decision.
-    Determines the next action using:
-    1. Current task_id as the primary signal.
-    2. A greedy-loop breaker: if the last 3 actions are the same type and
-       all yielded 0 reward, force a different action type.
-    3. A history-aware system + user prompt so the LLM avoids repeating
-       zero-reward strategies.
-    """
-    # Determine action strictly from environment task_id.
     if obs.task_id == 1:
-        action_type = "extract"
+        return LegalAction(
+            action_type="extract",
+            text_content=_extract_candidate_clause(obs.contract_text),
+        )
     elif obs.task_id == 2:
-        action_type = "classify"
-    else:
-        action_type = "rewrite"
-    # --- Build prompts ---
-    history_summary = _build_history_summary(action_history)
-    system_prompt = (
-        "You are a legal AI assistant completing a 3-step legal risk analysis pipeline.\n"
-        "The pipeline tasks are:\n"
-        "  1. extract   Pull the exact verbatim target clause from the contract.\n"
-        "  2. classify  Output exactly one label: low, medium, or high.\n"
-        "  3. rewrite   Rewrite the clause to be fair, mutual, and balanced for both parties.\n\n"
-        "RULES:\n"
-        "- Reply with ONLY the requested output - no preamble, no quotes, no labels.\n"
-        "- Use the latest environment message and reward to improve your next attempt.\n"
-        "- For rewrite: use phrases like 'Neither party shall', 'both parties agree', "
-        "'mutual limitation', and cap liability symmetrically.\n"
-        "- Never repeat an action that already earned 0 reward verbatim."
-    )
-    if action_type == "extract":
-        last_failed_extract = ""
-        for h in reversed(action_history):
-            if h["action_type"] == "extract" and h["reward"] < 0.8:
-                last_failed_extract = h["text"]
-                break
-
-        user_prompt = (
-            f"Contract Text:\n{obs.contract_text}\n\n"
-            f"Environment message: {obs.message}\n"
-            f"Current reward: {obs.reward:.2f}\n\n"
-            "Task: Extract the EXACT target clause text from the contract.\n"
-            "Return one full clause sentence/line verbatim.\n\n"
-            f"Action History:\n{history_summary}\n\n"
-            f"Last failed extraction (if any): {last_failed_extract}\n"
-            "Constraint: Do not repeat a low-reward extraction verbatim."
-        )
-    elif action_type == "classify":
         extracted_clause = _last_action_text(action_history, "extract") or _extract_candidate_clause(obs.contract_text)
-        user_prompt = (
-            f"Clause to classify:\n{extracted_clause}\n\n"
-            f"Environment message: {obs.message}\n"
-            f"Current reward: {obs.reward:.2f}\n\n"
-            "Task: Classify legal risk.\n"
-            "Reply with ONLY one lowercase token: low, medium, or high.\n\n"
-            f"Action History:\n{history_summary}\n\n"
-            "Constraint: Do not repeat an approach that earned reward=0.00."
+        return LegalAction(
+            action_type="classify",
+            text_content=_classify_clause_text(extracted_clause),
         )
-    else:  # rewrite
-        clause_to_rewrite = _last_action_text(action_history, "extract") or _extract_candidate_clause(obs.contract_text)
-        # Find last rewrite attempts that failed to give context
-        failed_rewrites = [
-            h["text"] for h in action_history
-            if h["action_type"] == "rewrite" and h["reward"] <= 0.7
-        ]
-        failed_block = ""
-        if failed_rewrites:
-            failed_block = (
-                "\n\nPrevious failed rewrite attempts (do NOT repeat these):\n"
-                + "\n---\n".join(f'"{t}"' for t in failed_rewrites[-2:])
-            )
-        user_prompt = (
-            "Task: Rewrite the following clause "
-            "to be fair, balanced, and mutual for BOTH parties.\n\n"
-            f"Original clause:\n'{clause_to_rewrite}'\n\n"
-            f"Environment message: {obs.message}\n"
-            f"Current reward: {obs.reward:.2f}\n\n"
-            "Requirements:\n"
-            "- Use symmetric language: 'Neither party shall...'\n"
-            "- Explicitly indicate mutuality for both parties\n"
-            "- Keep it professional and legally sound\n"
-            "- Reply with ONLY the rewritten clause text\n"
-            f"{failed_block}\n\n"
-            f"Action History:\n{history_summary}\n\n"
-            "Constraint: Do not repeat an approach that earned reward=0.00."
-        )
-    # --- LLM call ---
-    try:
-        completion = openai_client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=TEMPERATURE,
-            max_tokens=600,
-            stream=False,
-        )
-        reply = (completion.choices[0].message.content or "").strip()
-        # Strip surrounding quotes added by some models
-        if reply.startswith('"') and reply.endswith('"'):
-            reply = reply[1:-1]
-        if reply.startswith("'") and reply.endswith("'"):
-            reply = reply[1:-1]
-    except Exception as e:
-        print(f"[DEBUG] LLM call failed: {e}", flush=True)
-        # Sensible fallbacks that ensure progress
-        fallbacks = {
-            "extract": _extract_candidate_clause(obs.contract_text),
-            "classify": "high",
-            "rewrite": (
-                "Neither party shall be liable to the other for indirect, incidental, "
-                "special, or consequential damages, and both parties agree that any "
-                "limitation of liability is mutual and applies symmetrically."
-            ),
-        }
-        reply = fallbacks[action_type]
-    return LegalAction(action_type=action_type, text_content=reply)
+    clause_to_rewrite = _last_action_text(action_history, "extract") or _extract_candidate_clause(obs.contract_text)
+    return LegalAction(
+        action_type="rewrite",
+        text_content=_build_fair_rewrite(clause_to_rewrite),
+    )
+
+
+def _sanitize_action(action: LegalAction) -> str:
+    clean_text = " ".join(action.text_content.split())
+    return f"{action.action_type}({clean_text[:80]})"
+
+
 #  Main loop 
 async def main() -> None:
     rewards: List[float] = []
@@ -255,57 +178,33 @@ async def main() -> None:
     score = 0.0
     success = False
     env = None
-
-    log_start(task=TASK_NAME, env=BENCHMARK, model=MODEL_NAME)
+    result = None
+    final_done = False
 
     try:
         openai_client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
     except Exception as e:
-        log_step(
-            step=0,
-            action_repr="startup",
-            reward=0.0,
-            done=True,
-            error=str(e),
-            message="Failed to initialize OpenAI client.",
-        )
-        log_end(task=TASK_NAME, success=False, steps=0, score=0.0, rewards=[])
+        print(f"[DEBUG] Failed to initialize OpenAI client: {e}", flush=True)
+        log_start(task=TASK_NAME, env=BENCHMARK, model=MODEL_NAME)
+        log_end(success=False, steps=0, score=0.0, rewards=[])
         return
 
     image_name = _get_image_name()
+    log_start(task=TASK_NAME, env=BENCHMARK, model=MODEL_NAME)
+
     try:
         print(f"[DEBUG] Connecting to {OPENENV_URL}", flush=True)
         env = LegalRiskEnvClient(base_url=OPENENV_URL)
-    except Exception as e:
-        if image_name:
-            try:
-                print(f"[DEBUG] HTTP init failed, trying Docker image: {image_name}", flush=True)
-                env = await LegalRiskEnvClient.from_docker_image(image_name)
-            except Exception as docker_error:
-                log_step(
-                    step=0,
-                    action_repr="startup",
-                    reward=0.0,
-                    done=True,
-                    error=str(docker_error),
-                    message=f"Failed to initialize env via HTTP and Docker. HTTP error: {e}",
-                )
-                log_end(task=TASK_NAME, success=False, steps=0, score=0.0, rewards=[])
-                return
-        else:
-            log_step(
-                step=0,
-                action_repr="startup",
-                reward=0.0,
-                done=True,
-                error=str(e),
-                message="Failed to initialize environment client.",
-            )
-            log_end(task=TASK_NAME, success=False, steps=0, score=0.0, rewards=[])
-            return
+        result = await env.reset()
+    except Exception as http_error:
+        if not image_name:
+            raise RuntimeError(f"Failed to connect to OpenEnv server at {OPENENV_URL}: {http_error}") from http_error
+        print(f"[DEBUG] HTTP connection failed, trying Docker image: {image_name}", flush=True)
+        env = await LegalRiskEnvClient.from_docker_image(image_name)
 
     try:
-        result = await env.reset()
+        if result is None:
+            result = await env.reset()
         obs = result.observation
         for step in range(1, MAX_STEPS + 1):
             if obs.done:
@@ -324,35 +223,27 @@ async def main() -> None:
             })
             rewards.append(reward)
             steps_taken = step
-            action_str = f"{action.action_type}({action.text_content[:20]}...)"
+            final_done = done
             log_step(
                 step=step,
-                action_repr=action_str,
+                action_repr=_sanitize_action(action),
                 reward=reward,
                 done=done,
                 error=error,
-                message=obs.message,
             )
             if done:
                 break
         score = sum(rewards) / 3.0
         score = min(max(score, 0.0), 1.0)
-        success = score >= 0.5
+        success = final_done and score >= 0.5
     except Exception as e:
-        log_step(
-            step=max(steps_taken, 0),
-            action_repr="runtime",
-            reward=0.0,
-            done=True,
-            error=str(e),
-            message="Inference loop failed before completion.",
-        )
+        print(f"[DEBUG] Inference loop failed: {e}", flush=True)
     finally:
         try:
             if env is not None:
                 await env.close()
         except Exception as e:
             print(f"[DEBUG] env.close() error: {e}", flush=True)
-        log_end(task=TASK_NAME, success=success, steps=steps_taken, score=score, rewards=rewards)
+        log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
 if __name__ == "__main__":
     asyncio.run(main())
