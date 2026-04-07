@@ -20,6 +20,8 @@ BENCHMARK = "legal-risk-analyzer"
 MAX_STEPS = 8
 TEMPERATURE = 0.4
 HISTORY_WINDOW = 5  # last N steps passed to the LLM
+MIN_TASK_SCORE = 0.01
+MAX_TASK_SCORE = 0.99
 
 
 #  Structured STDOUT loggers 
@@ -47,6 +49,10 @@ def log_step(
 def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
     rewards_str = ",".join(f"{r:.2f}" for r in rewards)
     print(f"[END] success={str(success).lower()} steps={steps} score={score:.3f} rewards={rewards_str}", flush=True)
+
+
+def _bounded_score(value: float) -> float:
+    return max(MIN_TASK_SCORE, min(MAX_TASK_SCORE, value))
 
 
 def _get_image_name() -> str:
@@ -244,7 +250,7 @@ async def main() -> None:
     rewards: List[float] = []
     action_history: List[Dict] = []
     steps_taken = 0
-    score = 0.0
+    score = MIN_TASK_SCORE
     success = False
     env = None
     result = None
@@ -255,7 +261,7 @@ async def main() -> None:
     except Exception as e:
         print(f"[DEBUG] Failed to initialize OpenAI client: {e}", flush=True)
         log_start(task=TASK_NAME, env=BENCHMARK, model=MODEL_NAME)
-        log_end(success=False, steps=0, score=0.0, rewards=[])
+        log_end(success=False, steps=0, score=MIN_TASK_SCORE, rewards=[])
         return
 
     image_name = _get_image_name()
@@ -281,7 +287,7 @@ async def main() -> None:
             action = get_agent_action(openai_client, obs, action_history)
             result = await env.step(action)
             obs = result.observation
-            reward = result.reward or 0.0
+            reward = _bounded_score(result.reward or MIN_TASK_SCORE)
             done = result.done
             error = None
             # Record history for loop-breaker
@@ -302,8 +308,7 @@ async def main() -> None:
             )
             if done:
                 break
-        score = sum(rewards) / 3.0
-        score = min(max(score, 0.0), 1.0)
+        score = _bounded_score(sum(rewards) / 3.0) if rewards else MIN_TASK_SCORE
         success = final_done and score >= 0.5
     except Exception as e:
         print(f"[DEBUG] Inference loop failed: {e}", flush=True)

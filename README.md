@@ -77,7 +77,7 @@ Each response includes:
 ### Task 2: Classification (`task_id=2`)
 
 - Expected action: `classify`
-- Reward: `1.0` if normalized prediction exactly matches `current_scenario["legal_label"]`, else `0.0`
+- Reward: `0.99` if normalized prediction exactly matches `current_scenario["legal_label"]`, else `0.01`
 - Transition rule: on match, set `current_risk_assessment` and advance to Task 3
 
 ### Task 3: Mitigation Rewrite (`task_id=3`)
@@ -101,7 +101,7 @@ This guarantees scalar rewards and a clean terminal condition for RL.
 - Randomly samples a scenario from `BENCHMARK_DATA`
 - Returns observation with:
   - `message`: `Environment reset successful. Episode: <id>`
-  - `reward`: `0.0`
+  - `reward`: `0.01`
   - `task_id`: `1`
 
 ### `POST /step`
@@ -109,7 +109,7 @@ This guarantees scalar rewards and a clean terminal condition for RL.
 - Increments step count
 - Applies task-specific reward logic
 - Returns updated observation with explicit `message` + `reward`
-- Invalid action-type for current task returns `+0.00` reward with guidance message
+- Invalid action-type for current task returns `+0.01` reward with guidance message
 
 ---
 
@@ -180,9 +180,9 @@ Example log format:
 ```text
 [START] task=legal-risk-analysis env=legal-risk-analyzer model=Qwen/Qwen2.5-72B-Instruct
 [STEP] step=1 action='extract(...)' reward=0.93 done=false error=null message="Task 1 Complete: +0.93 Reward. Proceed to classification."
-[STEP] step=2 action='classify(...)' reward=1.00 done=false error=null message="Task 2 Complete: +1.00 Reward. Proceed to mitigation rewrite."
+[STEP] step=2 action='classify(...)' reward=0.99 done=false error=null message="Task 2 Complete: +0.99 Reward. Proceed to mitigation rewrite."
 [STEP] step=3 action='rewrite(...)' reward=0.75 done=true error=null message="Task 3 Complete: +0.75 Reward. Episode finished."
-[END] success=true steps=3 score=0.893 rewards=0.93,1.00,0.75
+[END] success=true steps=3 score=0.890 rewards=0.93,0.99,0.75
 ```
 
 ---

@@ -19,6 +19,8 @@ API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
 OPENENV_URL = os.getenv("OPENENV_URL", "http://localhost:8000")
 TEMPERATURE = 0.2
+MIN_TASK_SCORE = 0.01
+MAX_TASK_SCORE = 0.99
 
 
 DEMO_CONTRACT = """SERVICES AGREEMENT
@@ -28,6 +30,10 @@ DEMO_CONTRACT = """SERVICES AGREEMENT
    WITH THIS AGREEMENT.
 3. Termination. This agreement may be terminated by either party with 30 days notice.
 """
+
+
+def _bounded_score(value: float) -> float:
+    return max(MIN_TASK_SCORE, min(MAX_TASK_SCORE, value))
 
 #  Agent logic (sync wrapper over async client) 
 def _call_llm(client: OpenAI, system: str, user: str) -> str:
@@ -77,9 +83,9 @@ def run_analysis(contract_text: str) -> Tuple[str, str, str, str, str]:
     if common:
         p = len(common) / len(pred_toks)
         r = len(common) / len(gold_toks)
-        extract_reward = round(2 * p * r / (p + r), 2) if (p + r) > 0 else 0.0
+        extract_reward = round(_bounded_score(2 * p * r / (p + r)), 2) if (p + r) > 0 else MIN_TASK_SCORE
     else:
-        extract_reward = 0.0
+        extract_reward = MIN_TASK_SCORE
     rewards.append(extract_reward)
     step_logs.append(f"  [OK] Reward: **{extract_reward:.2f}**")
 
@@ -96,7 +102,7 @@ def run_analysis(contract_text: str) -> Tuple[str, str, str, str, str]:
         user=f"Clause:\n{extract_text}",
     )
     classify_clean = classify_text.strip().capitalize()
-    classify_reward = 1.0 if "high" in classify_clean.lower() else 0.0
+    classify_reward = MAX_TASK_SCORE if "high" in classify_clean.lower() else MIN_TASK_SCORE
     rewards.append(classify_reward)
     step_logs.append(f"  [OK] Risk Level: **{classify_clean}** | Reward: **{classify_reward:.2f}**")
 
@@ -122,13 +128,13 @@ def run_analysis(contract_text: str) -> Tuple[str, str, str, str, str]:
     # Keyword heuristic grade (mirrors server/environment.py)
     KEYWORDS = ["neither party", "both parties", "mutual", "each party", "symmetr"]
     hits = sum(1 for kw in KEYWORDS if kw in rewrite_text.lower())
-    rewrite_reward = 0.75 if hits >= 2 else (0.40 if hits == 1 else 0.10)
+    rewrite_reward = _bounded_score(0.75 if hits >= 2 else (0.40 if hits == 1 else 0.10))
     rewards.append(rewrite_reward)
     step_logs.append(f"  [OK] Reward: **{rewrite_reward:.2f}** (keyword hits: {hits})")
 
     
     # Summary
-    score = min(sum(rewards) / 3.0, 1.0)
+    score = _bounded_score(sum(rewards) / 3.0)
     success = score >= 0.5
     success_icon = "[SUCCESS] SUCCESS" if success else "[FAILED] FAILED"
     summary = (

@@ -69,18 +69,26 @@ FAIR_REWRITE_KEYWORDS = [
     "symmetric",
 ]
 
+MIN_TASK_SCORE = 0.01
+MAX_TASK_SCORE = 0.99
+
+
+def _bounded_score(value: float) -> float:
+    """Normalize grader outputs to the strict open interval required by validation."""
+    return max(MIN_TASK_SCORE, min(MAX_TASK_SCORE, value))
+
 
 def calculate_token_f1(pred: str, target: str) -> float:
     pred_tokens = set(pred.lower().split())
     target_tokens = set(target.lower().split())
     if not pred_tokens or not target_tokens:
-        return 0.0
+        return MIN_TASK_SCORE
     common = pred_tokens.intersection(target_tokens)
     if not common:
-        return 0.0
+        return MIN_TASK_SCORE
     precision = len(common) / len(pred_tokens)
     recall = len(common) / len(target_tokens)
-    return 2 * (precision * recall) / (precision + recall)
+    return _bounded_score(2 * (precision * recall) / (precision + recall))
 
 
 class LegalRiskEnv(Environment):
@@ -108,18 +116,18 @@ class LegalRiskEnv(Environment):
         self._done = False
         self.current_scenario = random.choice(BENCHMARK_DATA)
         return self._build_obs(
-            reward=0.0,
+            reward=MIN_TASK_SCORE,
             message=f"Environment reset successful. Episode: {self._state.episode_id}",
         )
     
     def step(self, action: LegalAction) -> LegalObservation:  # type: ignore[override]
         self._state.step_count += 1
-        reward = 0.0
+        reward = MIN_TASK_SCORE
         message = "No state change."
 
         if self._done:
             return self._build_obs(
-                reward=0.0,
+                reward=MIN_TASK_SCORE,
                 message="Episode already complete. Call reset() to start a new episode.",
             )
         
@@ -136,12 +144,12 @@ class LegalRiskEnv(Environment):
             pred = " ".join(action.text_content.lower().split())
             expected = self.current_scenario["legal_label"].lower()
             if pred == expected:
-                reward = 1.0
+                reward = MAX_TASK_SCORE
                 self._current_risk = self.current_scenario["legal_label"].title()
                 self._task_id = 3
                 message = f"Task 2 Complete: +{reward:.2f} Reward. Proceed to mitigation rewrite."
             else:
-                reward = 0.0
+                reward = MIN_TASK_SCORE
                 message = (
                     f"Task 2 Attempt: +{reward:.2f} Reward. Predicted '{pred}', expected legal label."
                 )
@@ -156,8 +164,9 @@ class LegalRiskEnv(Environment):
                     f"Task 3 Attempt: +{reward:.2f} Reward. Rewrite needs better mutuality/fairness."
                 )
         else:
+            reward = MIN_TASK_SCORE
             message = (
-                f"Invalid action '{action.action_type}' for task {self._task_id}: +0.00 Reward."
+                f"Invalid action '{action.action_type}' for task {self._task_id}: +{reward:.2f} Reward."
             )
                 
         return self._build_obs(reward=reward, message=message)
@@ -185,7 +194,7 @@ class LegalRiskEnv(Environment):
         keyword_score = 0.75 if hits >= 2 else (0.4 if hits == 1 else 0.1)
         # 2 keywords  clearly mutual rewrite, accept immediately.
         if keyword_score >= 0.6:
-            return keyword_score
+            return _bounded_score(keyword_score)
         #  Secondary: LLM scoring for borderline cases 
         model_name = os.environ.get("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
         prompt = (
@@ -203,11 +212,11 @@ class LegalRiskEnv(Environment):
             )
             raw = (response.choices[0].message.content or "").strip()
             val = float(raw)
-            llm_score = max(0.0, min(1.0, val))
+            llm_score = _bounded_score(val)
             # Take the higher of heuristic and LLM scores for fairness.
-            return max(keyword_score, llm_score)
+            return _bounded_score(max(keyword_score, llm_score))
         except Exception:
-            return keyword_score
+            return _bounded_score(keyword_score)
         
     @property
     def state(self) -> LegalState:
