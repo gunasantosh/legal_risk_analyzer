@@ -11,7 +11,6 @@ except ImportError:
     from .models import LegalAction, LegalObservation
 
 
-IMAGE_NAME = os.getenv("IMAGE_NAME", "").strip()
 API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY", "")
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
@@ -47,9 +46,21 @@ def log_step(
     )
 
 
-def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
+def log_end(task: str, success: bool, steps: int, score: float, rewards: List[float]) -> None:
     rewards_str = ",".join(f"{r:.2f}" for r in rewards)
-    print(f"[END] success={str(success).lower()} steps={steps} score={score:.3f} rewards={rewards_str}", flush=True)
+    print(
+        f"[END] task={task} success={str(success).lower()} steps={steps} "
+        f"score={score:.3f} rewards={rewards_str}",
+        flush=True,
+    )
+
+
+def _get_image_name() -> str:
+    """
+    Prefer explicit process environment configuration and avoid accidental
+    dependence on a checked-in `.env` value during remote evaluation.
+    """
+    return os.environ.get("IMAGE_NAME", "").strip()
 
 
 #  Action history helpers 
@@ -238,23 +249,61 @@ def get_agent_action(
     return LegalAction(action_type=action_type, text_content=reply)
 #  Main loop 
 async def main() -> None:
-    openai_client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
-    try:
-        if IMAGE_NAME:
-            print(f"[DEBUG] Connecting via Docker image: {IMAGE_NAME}", flush=True)
-            env = await LegalRiskEnvClient.from_docker_image(IMAGE_NAME)
-        else:
-            print(f"[DEBUG] Connecting to {OPENENV_URL}", flush=True)
-            env = LegalRiskEnvClient(base_url=OPENENV_URL)
-    except Exception as e:
-        print(f"[DEBUG] Failed to init env: {e}", flush=True)
-        return
     rewards: List[float] = []
     action_history: List[Dict] = []
     steps_taken = 0
     score = 0.0
     success = False
+    env = None
+
     log_start(task=TASK_NAME, env=BENCHMARK, model=MODEL_NAME)
+
+    try:
+        openai_client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+    except Exception as e:
+        log_step(
+            step=0,
+            action_repr="startup",
+            reward=0.0,
+            done=True,
+            error=str(e),
+            message="Failed to initialize OpenAI client.",
+        )
+        log_end(task=TASK_NAME, success=False, steps=0, score=0.0, rewards=[])
+        return
+
+    image_name = _get_image_name()
+    try:
+        print(f"[DEBUG] Connecting to {OPENENV_URL}", flush=True)
+        env = LegalRiskEnvClient(base_url=OPENENV_URL)
+    except Exception as e:
+        if image_name:
+            try:
+                print(f"[DEBUG] HTTP init failed, trying Docker image: {image_name}", flush=True)
+                env = await LegalRiskEnvClient.from_docker_image(image_name)
+            except Exception as docker_error:
+                log_step(
+                    step=0,
+                    action_repr="startup",
+                    reward=0.0,
+                    done=True,
+                    error=str(docker_error),
+                    message=f"Failed to initialize env via HTTP and Docker. HTTP error: {e}",
+                )
+                log_end(task=TASK_NAME, success=False, steps=0, score=0.0, rewards=[])
+                return
+        else:
+            log_step(
+                step=0,
+                action_repr="startup",
+                reward=0.0,
+                done=True,
+                error=str(e),
+                message="Failed to initialize environment client.",
+            )
+            log_end(task=TASK_NAME, success=False, steps=0, score=0.0, rewards=[])
+            return
+
     try:
         result = await env.reset()
         obs = result.observation
@@ -289,13 +338,21 @@ async def main() -> None:
         score = sum(rewards) / 3.0
         score = min(max(score, 0.0), 1.0)
         success = score >= 0.5
+    except Exception as e:
+        log_step(
+            step=max(steps_taken, 0),
+            action_repr="runtime",
+            reward=0.0,
+            done=True,
+            error=str(e),
+            message="Inference loop failed before completion.",
+        )
     finally:
         try:
-            await env.close()
+            if env is not None:
+                await env.close()
         except Exception as e:
             print(f"[DEBUG] env.close() error: {e}", flush=True)
-        if "rewards" not in locals():
-            rewards, steps_taken, score, success = [], 0, 0.0, False
-        log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
+        log_end(task=TASK_NAME, success=success, steps=steps_taken, score=score, rewards=rewards)
 if __name__ == "__main__":
     asyncio.run(main())
