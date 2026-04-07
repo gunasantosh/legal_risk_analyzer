@@ -94,7 +94,7 @@ class LegalRiskEnv(Environment):
         self._done = False
         self.current_scenario = random.choice(BENCHMARK_DATA)
         api_base_url = os.environ.get("API_BASE_URL")
-        hf_token = os.environ.get("HF_TOKEN") or "dummy"
+        hf_token = os.environ.get("API_KEY") or os.environ.get("HF_TOKEN") or "dummy"
         self.client = Client(
             base_url=api_base_url if api_base_url else None,
             api_key=hf_token,

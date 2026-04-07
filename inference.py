@@ -11,7 +11,7 @@ except ImportError:
     from .models import LegalAction, LegalObservation
 
 
-API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY", "")
+API_KEY = os.getenv("API_KEY") or os.getenv("HF_TOKEN", "")
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
 TASK_NAME = os.getenv("MY_ENV_V4_TASK", "legal-risk-analysis")
@@ -112,7 +112,7 @@ def _last_action_text(action_history: List[Dict], action_type: str) -> str:
     return ""
 
 
-def _classify_clause_text(clause_text: str) -> str:
+def _fallback_classify_clause_text(clause_text: str) -> str:
     text = clause_text.lower()
     if "limitation of liability" in text or "in no event shall" in text:
         return "high"
@@ -123,7 +123,7 @@ def _classify_clause_text(clause_text: str) -> str:
     return "medium"
 
 
-def _build_fair_rewrite(clause_text: str) -> str:
+def _fallback_build_fair_rewrite(clause_text: str) -> str:
     text = clause_text.lower()
     if "indemn" in text:
         return (
@@ -142,27 +142,96 @@ def _build_fair_rewrite(clause_text: str) -> str:
     )
 
 
+def _call_model(openai_client: OpenAI, system_prompt: str, user_prompt: str, max_tokens: int = 220) -> str:
+    completion = openai_client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=TEMPERATURE,
+        max_tokens=max_tokens,
+        stream=False,
+    )
+    return (completion.choices[0].message.content or "").strip()
+
+
 def get_agent_action(
     openai_client: OpenAI,
     obs: LegalObservation,
     action_history: List[Dict],
 ) -> LegalAction:
+    history_summary = _build_history_summary(action_history)
     if obs.task_id == 1:
-        return LegalAction(
-            action_type="extract",
-            text_content=_extract_candidate_clause(obs.contract_text),
-        )
-    elif obs.task_id == 2:
+        fallback = _extract_candidate_clause(obs.contract_text)
+        try:
+            reply = _call_model(
+                openai_client,
+                system_prompt=(
+                    "You extract the exact target clause from a contract. "
+                    "Reply with only the single clause text, verbatim, no quotes."
+                ),
+                user_prompt=(
+                    f"Contract text:\n{obs.contract_text}\n\n"
+                    f"Environment message: {obs.message}\n"
+                    f"Action history:\n{history_summary}\n\n"
+                    "Return the exact clause that appears to carry the main legal risk."
+                ),
+                max_tokens=160,
+            )
+            text = reply if reply else fallback
+        except Exception as e:
+            print(f"[DEBUG] Model extract failed: {e}", flush=True)
+            text = fallback
+        return LegalAction(action_type="extract", text_content=text)
+
+    if obs.task_id == 2:
         extracted_clause = _last_action_text(action_history, "extract") or _extract_candidate_clause(obs.contract_text)
-        return LegalAction(
-            action_type="classify",
-            text_content=_classify_clause_text(extracted_clause),
-        )
+        fallback = _fallback_classify_clause_text(extracted_clause)
+        try:
+            reply = _call_model(
+                openai_client,
+                system_prompt=(
+                    "You classify legal risk. Reply with exactly one lowercase token: "
+                    "low, medium, or high."
+                ),
+                user_prompt=(
+                    f"Clause:\n{extracted_clause}\n\n"
+                    f"Environment message: {obs.message}\n"
+                    f"Action history:\n{history_summary}\n\n"
+                    "Choose the best risk label."
+                ),
+                max_tokens=8,
+            ).lower()
+            text = reply if reply in {"low", "medium", "high"} else fallback
+        except Exception as e:
+            print(f"[DEBUG] Model classify failed: {e}", flush=True)
+            text = fallback
+        return LegalAction(action_type="classify", text_content=text)
+
     clause_to_rewrite = _last_action_text(action_history, "extract") or _extract_candidate_clause(obs.contract_text)
-    return LegalAction(
-        action_type="rewrite",
-        text_content=_build_fair_rewrite(clause_to_rewrite),
-    )
+    fallback = _fallback_build_fair_rewrite(clause_to_rewrite)
+    try:
+        reply = _call_model(
+            openai_client,
+            system_prompt=(
+                "You rewrite legal clauses to be fair and mutual. "
+                "Reply with only the rewritten clause text."
+            ),
+            user_prompt=(
+                f"Original clause:\n{clause_to_rewrite}\n\n"
+                f"Environment message: {obs.message}\n"
+                f"Action history:\n{history_summary}\n\n"
+                "Rewrite it so it is balanced for both parties. Include explicit mutual language "
+                "such as 'both parties agree', 'each party', or 'neither party'."
+            ),
+            max_tokens=180,
+        )
+        text = reply if reply else fallback
+    except Exception as e:
+        print(f"[DEBUG] Model rewrite failed: {e}", flush=True)
+        text = fallback
+    return LegalAction(action_type="rewrite", text_content=text)
 
 
 def _sanitize_action(action: LegalAction) -> str:
